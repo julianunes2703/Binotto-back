@@ -10,8 +10,9 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 /**
- * CORS — permite localhost no dev, *.vercel.app (previews) e qualquer origem listada em CORS_ORIGIN (separadas por vírgula)
- * Ex.: CORS_ORIGIN=https://seu-site.vercel.app,https://outro-dominio.com
+ * CORS: libera localhost (dev), *.vercel.app (deploy do front)
+ * e quaisquer domínios que você adicionar em CORS_ORIGIN (separados por vírgula).
+ * Se preferir abrir para todos, troque por app.use(cors()).
  */
 const allowlist = (process.env.CORS_ORIGIN || "")
   .split(",")
@@ -23,9 +24,9 @@ function isAllowedOrigin(origin) {
   try {
     const url = new URL(origin);
     if (url.hostname === "localhost" || url.hostname === "127.0.0.1") return true;
-    if (url.hostname.endsWith(".vercel.app")) return true; // previews + prod da Vercel
+    if (url.hostname.endsWith(".vercel.app")) return true;
   } catch {
-    // se não for URL válida, cai pro allowlist explícito
+    // se não for URL válida, cai para allowlist explícito
   }
   return allowlist.includes(origin);
 }
@@ -40,84 +41,12 @@ app.use(
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- Health & raiz ---
+// --- Health & raiz (úteis para Render) ---
 app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 app.get("/", (_, res) => res.status(200).send("OK"));
 
-// --- Schema de saída (Structured Outputs) ---
-const schema = {
-  type: "object",
-  properties: {
-    resumo: { type: "string" },
-    destaques: { type: "array", items: { type: "string" } },
-    riscos: { type: "array", items: { type: "string" } },
-    oportunidades: { type: "array", items: { type: "string" } },
-    tops: {
-      type: "object",
-      properties: {
-        cidades: { type: "array", items: { type: "string" } },
-        produtos: { type: "array", items: { type: "string" } },
-      },
-      required: ["cidades", "produtos"],
-      additionalProperties: false,
-    },
-    acoesRecomendadas: { type: "array", items: { type: "string" } },
-    tarefas: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          titulo: { type: "string" },
-          descricao: { type: "string" },
-          responsavel: { type: "string" },
-          prioridade: { enum: ["alta", "media", "baixa"] },
-          impacto: { enum: ["receita", "margem", "cobertura", "mix", "operacao"] },
-          prazoDias: { type: "number" },
-        },
-        required: ["titulo", "descricao", "responsavel", "prioridade", "impacto", "prazoDias"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["resumo", "destaques", "riscos", "oportunidades", "tops", "acoesRecomendadas", "tarefas"],
-  additionalProperties: false,
-};
+const PORT = process.env.PORT || 3001;
 
-// util: tenta extrair JSON estruturado de diferentes formatos do SDK
-function extractStructured(resp) {
-  // Responses API costuma ter: resp.output[0].content = [{type: 'output_json', parsed: {...}} | {type:'output_text', text:'...'} ...]
-  const first = resp?.output?.[0];
-  const content = Array.isArray(first?.content) ? first.content : [];
-
-  // 1) preferimos output_json
-  const jsonPart = content.find((c) => c?.type === "output_json" && c?.parsed);
-  if (jsonPart?.parsed) return jsonPart.parsed;
-
-  // 2) fallback: se vier texto, tentar parsear
-  const textPart = content.find((c) => c?.type === "output_text" && typeof c?.text === "string");
-  if (textPart?.text) {
-    const raw = String(textPart.text).trim().replace(/^```json\s*/i, "").replace(/```$/i, "");
-    try {
-      return JSON.parse(raw);
-    } catch {
-      // se falhar, cai pro throw abaixo
-    }
-  }
-
-  // 3) último fallback: resp.output_text agregado (algumas versões expõem)
-  if (resp?.output_text) {
-    const raw = String(resp.output_text).trim().replace(/^```json\s*/i, "").replace(/```$/i, "");
-    try {
-      return JSON.parse(raw);
-    } catch {
-      // ignore
-    }
-  }
-
-  throw new Error("Resposta sem JSON estruturado");
-}
-
-// --- Rota principal ---
 app.post("/analyze", async (req, res) => {
   try {
     const { ano, mes, metric, resumo } = req.body;
@@ -125,8 +54,8 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Parâmetros faltando" });
     }
 
-    const system = `Você é um analista de operações e vendas.
-Responda SEMPRE usando o schema JSON fornecido, sem markdown e sem comentários. Seja objetivo e acionável.`;
+    const system = `Você é um analista de operações e vendas. 
+Responda SEMPRE em JSON válido (UTF-8), sem markdown e sem comentários. Seja objetivo e acionável.`;
 
     const user = `
 Analise o mês ${mes}/${ano} considerando a métrica "${metric}".
@@ -135,40 +64,82 @@ Use o comparativo com o mês anterior para identificar variações.
 DADOS (JSON):
 ${JSON.stringify(resumo, null, 2)}
 
+Responda EXCLUSIVAMENTE em JSON com este formato exato:
+{
+  "resumo": "string obrigatória, objetiva",
+  "destaques": ["bullet 1", "bullet 2"],
+  "riscos": ["bullet 1", "bullet 2"],
+  "oportunidades": ["bullet 1", "bullet 2"],
+  "tops": {
+    "cidades": ["Cidade A (motivo opcional)", "Cidade B ..."],
+    "produtos": ["Produto X (motivo opcional)", "Produto Y ..."]
+  },
+  "acoesRecomendadas": ["ação 1", "ação 2", "ação 3"],
+  "tarefas": [
+    {
+      "titulo": "string curta e clara",
+      "descricao": "o que exatamente fazer",
+      "responsavel": "equipe ou papel (ex.: Comercial/ROTA 3)",
+      "prioridade": "alta|media|baixa",
+      "impacto": "receita|margem|cobertura|mix|operacao",
+      "prazoDias": 7
+    }
+  ]
+}
 Regras:
 - Se algum campo não se aplicar, devolva-o como lista vazia [] (NUNCA omita campos).
-`.trim();
+- Nada fora do JSON.
+`;
 
     const resp = await openai.responses.create({
       model: "gpt-4o-mini",
       input: [
         { role: "system", content: system },
-        { role: "user", content: user },
+        { role: "user", content: user }
       ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "AnaliseMensal",
-          schema,
-          strict: true,
-        },
-      },
-      temperature: 0.2,
+      temperature: 0.2
     });
 
-    const data = extractStructured(resp);
+    // extrai texto e tenta parsear
+    let raw =
+      resp.output_text ??
+      resp.output?.[0]?.content?.[0]?.text ??
+      "";
+
+    raw = String(raw).trim().replace(/^```json\s*/i, "").replace(/```$/i, "");
+
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      // reparo mínimo para JSON válido
+      const fix = await openai.responses.create({
+        model: "gpt-4o-mini",
+        input: [
+          { role: "system", content: "Conserte para JSON válido. Responda apenas o JSON." },
+          { role: "user", content: raw }
+        ],
+        temperature: 0
+      });
+      const fixed = (fix.output_text || "").trim().replace(/^```json\s*/i, "").replace(/```$/i, "");
+      data = JSON.parse(fixed);
+    }
+
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("Erro /analyze", {
       message: err?.message,
+      name: err?.name,
+      code: err?.code,
+      status: err?.status,
       requestId: err?._request_id,
-      stack: err?.stack,
+      responseStatus: err?.response?.status,
+      responseData: err?.response?.data
     });
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
-const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`IA analyzer rodando em http://localhost:${PORT}`);
 });
